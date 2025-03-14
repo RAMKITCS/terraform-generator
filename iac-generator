@@ -1,0 +1,493 @@
+import os
+import logging
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_community.chat_models import ChatOpenAI
+from io import BytesIO
+
+# Load environment variables securely
+load_dotenv()
+openai_api_key = os.getenv("OPENAI_API_KEY")
+
+if not openai_api_key:
+    st.error("❌ Missing OpenAI API Key!\n\n💡 Create a `.env` file and add `OPENAI_API_KEY=<YOUR_API_KEY>`.")
+    st.stop()
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+logging.info("Starting code generation process...")
+
+# Initialize OpenAI model
+llm = ChatOpenAI(
+    model_name="gpt-4o",
+    openai_api_key=openai_api_key,
+    temperature=0.1,
+    max_retries=3
+)
+
+# Session state for refinement
+if "refinement_iteration" not in st.session_state:
+    st.session_state.refinement_iteration = 0
+
+# Dynamic dropdown values with option to add custom services
+default_services = {
+    "AWS": ["EC2", "S3", "RDS", "EKS", "Load Balancer", "Firewall"],
+    "Azure": ["Virtual Machines", "AKS", "Blob Storage", "SQL Database", "Firewall"],
+    "GCP": ["Compute Engine", "GKE", "Cloud Storage", "Cloud SQL", "Firewall"]
+}
+
+if "custom_services" not in st.session_state:
+    st.session_state.custom_services = {provider: [] for provider in default_services}
+
+# Utility function for safe model invocation
+def safe_invoke(prompt):
+    try:
+        response = llm.invoke(prompt)
+        return response.content.strip() if hasattr(response, 'content') else str(response).strip() if response else "❌ No response received!"
+    except Exception as e:
+        logging.error(f"Error in code generation: {e}")
+        st.error(f"❌ Error generating configuration: {str(e)}")
+        return None
+
+# Function to refine Terraform code
+# Ensures `variables.tf` and `main.tf` are handled separately
+def refine_code(feedback, existing_code, cloud_provider, service):
+    prompt = f"""
+    Refine the following Terraform configuration based on this user feedback:
+    
+    Feedback: {feedback}
+    
+    Configuration:
+    {existing_code}
+    
+    Ensure the output remains structured, clean, and easy to read.
+    Improve security, efficiency, maintainability, and follow best practices.
+    Output only the updated configuration.
+    """
+    return safe_invoke(prompt)
+
+# Function to generate modular Terraform code
+def generate_code(cloud_provider, service):
+    prompts = {
+        "variables": f"""
+        Create a Terraform `variables.tf` file for {service} on {cloud_provider}.
+        Include key variables like region, instance type, and scaling configurations.
+        Follow naming conventions and add meaningful descriptions for all variables.
+        """,
+        "main": f"""
+        Create a Terraform `main.tf` file for {service} on {cloud_provider}.
+        Include clear resource blocks with appropriate tags, encryption settings, and IAM roles.
+        Follow best practices for modularization, security, and scalability.
+        """,
+        "outputs": f"""
+        Create a Terraform `outputs.tf` file for {service} on {cloud_provider}.
+        Define meaningful output variables to simplify integrations.
+        """,
+        "instructions": f"""
+        Provide clear instructions for deploying the generated Terraform files.
+        Include steps for `terraform init`, `terraform plan`, and `terraform apply`.
+        Add best practices for securing state files and backend setup.
+        """
+    }
+
+    files = {}
+    for file_name, prompt in prompts.items():
+        files[file_name] = safe_invoke(prompt)
+
+    return files
+
+# Display code and download option
+def display_code_with_download(files):
+    for file_name, code in files.items():
+        if code:
+            file_extension = ".tf" if file_name != "instructions" else ".md"
+            st.subheader(f"📄 {file_name}.tf")
+            st.code(code, language="hcl" if file_extension == ".tf" else "markdown", line_numbers=True)
+            file_bytes = BytesIO(code.encode('utf-8'))
+            st.download_button(label=f"📥 Download {file_name}{file_extension}", data=file_bytes, file_name=f"{file_name}{file_extension}", mime="text/plain")
+
+# Streamlit UI
+st.set_page_config(layout="wide")
+st.title("🚀 AI-Powered Terraform Code Generator")
+
+# Sidebar configuration
+st.sidebar.header("🔧 Configuration")
+cloud_provider = st.sidebar.selectbox("Choose Cloud Provider", ["AWS", "Azure", "GCP"])
+service_options = default_services[cloud_provider] + st.session_state.custom_services[cloud_provider]
+service = st.sidebar.selectbox("Choose Service", service_options)
+
+# Add Custom Service
+st.sidebar.subheader("➕ Add Custom Service")
+custom_service = st.sidebar.text_input("Enter Custom Service Name")
+if st.sidebar.button("Add Service"):
+    if custom_service.strip():
+        st.session_state.custom_services[cloud_provider].append(custom_service.strip())
+        st.success(f"✅ {custom_service} added successfully to {cloud_provider} services!")
+
+# Generate configuration
+if st.sidebar.button("Generate Configuration"):
+    if not cloud_provider or not service:
+        st.warning("⚠️ Please select a Cloud Provider and Service before generating the configuration.")
+    else:
+        st.session_state.refinement_iteration = 0
+        generated_files = generate_code(cloud_provider, service)
+        if generated_files:
+            st.session_state.generated_files = generated_files
+            st.success(f"✅ Terraform Configuration generated successfully!")
+            display_code_with_download(generated_files)
+
+# Refinement Section
+st.subheader("🔄 Improve Configuration with Feedback")
+st.write("Provide specific feedback like:")
+st.markdown("""
+- Add security groups for better access control  
+- Refactor variables for improved flexibility  
+- Include output blocks for improved integration  
+""")
+
+refine_feedback = st.text_area("✍️ Provide feedback to refine the configuration:", height=150)
+if st.button("Refine Configuration"):
+    if "generated_files" not in st.session_state or not st.session_state.generated_files:
+        st.warning("⚠️ Generate a configuration first before refining.")
+    elif not refine_feedback.strip():
+        st.warning("⚠️ Please provide feedback before refining.")
+    else:
+        st.session_state.refinement_iteration += 1
+        refined_files = {
+    'variables': refine_code(refine_feedback, st.session_state.generated_files['variables'], cloud_provider, service),
+    'main': refine_code(refine_feedback, st.session_state.generated_files['main'], cloud_provider, service),
+    'outputs': st.session_state.generated_files['outputs'],
+    'instructions': st.session_state.generated_files['instructions']
+}
+        if refined_files:
+            st.session_state.generated_files = refined_files
+            st.success(f"✅ Configuration refined successfully! (Iteration {st.session_state.refinement_iteration})")
+            display_code_with_download(refined_files)import os
+import logging
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_community.chat_models import ChatOpenAI
+from io import BytesIO
+
+# Load environment variables securely
+load_dotenv()
+openai_api_key = os.getenv("OPENAI_API_KEY")
+
+if not openai_api_key:
+    st.error("❌ Missing OpenAI API Key!\n\n💡 Create a `.env` file and add `OPENAI_API_KEY=<YOUR_API_KEY>`.")
+    st.stop()
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+logging.info("Starting code generation process...")
+
+# Initialize OpenAI model
+llm = ChatOpenAI(
+    model_name="gpt-4o",
+    openai_api_key=openai_api_key,
+    temperature=0.1,
+    max_retries=3
+)
+
+# Session state for refinement
+if "refinement_iteration" not in st.session_state:
+    st.session_state.refinement_iteration = 0
+
+# Dynamic dropdown values with option to add custom services
+default_services = {
+    "AWS": ["EC2", "S3", "RDS", "EKS", "Load Balancer", "Firewall"],
+    "Azure": ["Virtual Machines", "AKS", "Blob Storage", "SQL Database", "Firewall"],
+    "GCP": ["Compute Engine", "GKE", "Cloud Storage", "Cloud SQL", "Firewall"]
+}
+
+if "custom_services" not in st.session_state:
+    st.session_state.custom_services = {provider: [] for provider in default_services}
+
+# Utility function for safe model invocation
+def safe_invoke(prompt):
+    try:
+        response = llm.invoke(prompt)
+        return response.content.strip() if hasattr(response, 'content') else str(response).strip() if response else "❌ No response received!"
+    except Exception as e:
+        logging.error(f"Error in code generation: {e}")
+        st.error(f"❌ Error generating configuration: {str(e)}")
+        return None
+
+# Function to refine Terraform code
+# Ensures `variables.tf` and `main.tf` are handled separately
+def refine_code(feedback, existing_code, cloud_provider, service):
+    prompt = f"""
+    Refine the following Terraform configuration based on this user feedback:
+    
+    Feedback: {feedback}
+    
+    Configuration:
+    {existing_code}
+    
+    Ensure the output remains structured, clean, and easy to read.
+    Improve security, efficiency, maintainability, and follow best practices.
+    Output only the updated configuration.
+    """
+    return safe_invoke(prompt)
+
+# Function to generate modular Terraform code
+def generate_code(cloud_provider, service):
+    prompts = {
+        "variables": f"""
+        Create a Terraform `variables.tf` file for {service} on {cloud_provider}.
+        Include key variables like region, instance type, and scaling configurations.
+        Follow naming conventions and add meaningful descriptions for all variables.
+        """,
+        "main": f"""
+        Create a Terraform `main.tf` file for {service} on {cloud_provider}.
+        Include clear resource blocks with appropriate tags, encryption settings, and IAM roles.
+        Follow best practices for modularization, security, and scalability.
+        """,
+        "outputs": f"""
+        Create a Terraform `outputs.tf` file for {service} on {cloud_provider}.
+        Define meaningful output variables to simplify integrations.
+        """,
+        "instructions": f"""
+        Provide clear instructions for deploying the generated Terraform files.
+        Include steps for `terraform init`, `terraform plan`, and `terraform apply`.
+        Add best practices for securing state files and backend setup.
+        """
+    }
+
+    files = {}
+    for file_name, prompt in prompts.items():
+        files[file_name] = safe_invoke(prompt)
+
+    return files
+
+# Display code and download option
+def display_code_with_download(files):
+    for file_name, code in files.items():
+        if code:
+            file_extension = ".tf" if file_name != "instructions" else ".md"
+            st.subheader(f"📄 {file_name}.tf")
+            st.code(code, language="hcl" if file_extension == ".tf" else "markdown", line_numbers=True)
+            file_bytes = BytesIO(code.encode('utf-8'))
+            st.download_button(label=f"📥 Download {file_name}{file_extension}", data=file_bytes, file_name=f"{file_name}{file_extension}", mime="text/plain")
+
+# Streamlit UI
+st.set_page_config(layout="wide")
+st.title("🚀 AI-Powered Terraform Code Generator")
+
+# Sidebar configuration
+st.sidebar.header("🔧 Configuration")
+cloud_provider = st.sidebar.selectbox("Choose Cloud Provider", ["AWS", "Azure", "GCP"])
+service_options = default_services[cloud_provider] + st.session_state.custom_services[cloud_provider]
+service = st.sidebar.selectbox("Choose Service", service_options)
+
+# Add Custom Service
+st.sidebar.subheader("➕ Add Custom Service")
+custom_service = st.sidebar.text_input("Enter Custom Service Name")
+if st.sidebar.button("Add Service"):
+    if custom_service.strip():
+        st.session_state.custom_services[cloud_provider].append(custom_service.strip())
+        st.success(f"✅ {custom_service} added successfully to {cloud_provider} services!")
+
+# Generate configuration
+if st.sidebar.button("Generate Configuration"):
+    if not cloud_provider or not service:
+        st.warning("⚠️ Please select a Cloud Provider and Service before generating the configuration.")
+    else:
+        st.session_state.refinement_iteration = 0
+        generated_files = generate_code(cloud_provider, service)
+        if generated_files:
+            st.session_state.generated_files = generated_files
+            st.success(f"✅ Terraform Configuration generated successfully!")
+            display_code_with_download(generated_files)
+
+# Refinement Section
+st.subheader("🔄 Improve Configuration with Feedback")
+st.write("Provide specific feedback like:")
+st.markdown("""
+- Add security groups for better access control  
+- Refactor variables for improved flexibility  
+- Include output blocks for improved integration  
+""")
+
+refine_feedback = st.text_area("✍️ Provide feedback to refine the configuration:", height=150)
+if st.button("Refine Configuration"):
+    if "generated_files" not in st.session_state or not st.session_state.generated_files:
+        st.warning("⚠️ Generate a configuration first before refining.")
+    elif not refine_feedback.strip():
+        st.warning("⚠️ Please provide feedback before refining.")
+    else:
+        st.session_state.refinement_iteration += 1
+        refined_files = {
+    'variables': refine_code(refine_feedback, st.session_state.generated_files['variables'], cloud_provider, service),
+    'main': refine_code(refine_feedback, st.session_state.generated_files['main'], cloud_provider, service),
+    'outputs': st.session_state.generated_files['outputs'],
+    'instructions': st.session_state.generated_files['instructions']
+}
+        if refined_files:
+            st.session_state.generated_files = refined_files
+            st.success(f"✅ Configuration refined successfully! (Iteration {st.session_state.refinement_iteration})")
+            display_code_with_download(refined_files)import os
+import logging
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_community.chat_models import ChatOpenAI
+from io import BytesIO
+
+# Load environment variables securely
+load_dotenv()
+openai_api_key = os.getenv("OPENAI_API_KEY")
+
+if not openai_api_key:
+    st.error("❌ Missing OpenAI API Key!\n\n💡 Create a `.env` file and add `OPENAI_API_KEY=<YOUR_API_KEY>`.")
+    st.stop()
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+logging.info("Starting code generation process...")
+
+# Initialize OpenAI model
+llm = ChatOpenAI(
+    model_name="gpt-4o",
+    openai_api_key=openai_api_key,
+    temperature=0.1,
+    max_retries=3
+)
+
+# Session state for refinement
+if "refinement_iteration" not in st.session_state:
+    st.session_state.refinement_iteration = 0
+
+# Dynamic dropdown values with option to add custom services
+default_services = {
+    "AWS": ["EC2", "S3", "RDS", "EKS", "Load Balancer", "Firewall"],
+    "Azure": ["Virtual Machines", "AKS", "Blob Storage", "SQL Database", "Firewall"],
+    "GCP": ["Compute Engine", "GKE", "Cloud Storage", "Cloud SQL", "Firewall"]
+}
+
+if "custom_services" not in st.session_state:
+    st.session_state.custom_services = {provider: [] for provider in default_services}
+
+# Utility function for safe model invocation
+def safe_invoke(prompt):
+    try:
+        response = llm.invoke(prompt)
+        return response.content.strip() if hasattr(response, 'content') else str(response).strip() if response else "❌ No response received!"
+    except Exception as e:
+        logging.error(f"Error in code generation: {e}")
+        st.error(f"❌ Error generating configuration: {str(e)}")
+        return None
+
+# Function to refine Terraform code
+# Ensures `variables.tf` and `main.tf` are handled separately
+def refine_code(feedback, existing_code, cloud_provider, service):
+    prompt = f"""
+    Refine the following Terraform configuration based on this user feedback:
+    
+    Feedback: {feedback}
+    
+    Configuration:
+    {existing_code}
+    
+    Ensure the output remains structured, clean, and easy to read.
+    Improve security, efficiency, maintainability, and follow best practices.
+    Output only the updated configuration.
+    """
+    return safe_invoke(prompt)
+
+# Function to generate modular Terraform code
+def generate_code(cloud_provider, service):
+    prompts = {
+        "variables": f"""
+        Create a Terraform `variables.tf` file for {service} on {cloud_provider}.
+        Include key variables like region, instance type, and scaling configurations.
+        Follow naming conventions and add meaningful descriptions for all variables.
+        """,
+        "main": f"""
+        Create a Terraform `main.tf` file for {service} on {cloud_provider}.
+        Include clear resource blocks with appropriate tags, encryption settings, and IAM roles.
+        Follow best practices for modularization, security, and scalability.
+        """,
+        "outputs": f"""
+        Create a Terraform `outputs.tf` file for {service} on {cloud_provider}.
+        Define meaningful output variables to simplify integrations.
+        """,
+        "instructions": f"""
+        Provide clear instructions for deploying the generated Terraform files.
+        Include steps for `terraform init`, `terraform plan`, and `terraform apply`.
+        Add best practices for securing state files and backend setup.
+        """
+    }
+
+    files = {}
+    for file_name, prompt in prompts.items():
+        files[file_name] = safe_invoke(prompt)
+
+    return files
+
+# Display code and download option
+def display_code_with_download(files):
+    for file_name, code in files.items():
+        if code:
+            file_extension = ".tf" if file_name != "instructions" else ".md"
+            st.subheader(f"📄 {file_name}.tf")
+            st.code(code, language="hcl" if file_extension == ".tf" else "markdown", line_numbers=True)
+            file_bytes = BytesIO(code.encode('utf-8'))
+            st.download_button(label=f"📥 Download {file_name}{file_extension}", data=file_bytes, file_name=f"{file_name}{file_extension}", mime="text/plain")
+
+# Streamlit UI
+st.set_page_config(layout="wide")
+st.title("🚀 AI-Powered Terraform Code Generator")
+
+# Sidebar configuration
+st.sidebar.header("🔧 Configuration")
+cloud_provider = st.sidebar.selectbox("Choose Cloud Provider", ["AWS", "Azure", "GCP"])
+service_options = default_services[cloud_provider] + st.session_state.custom_services[cloud_provider]
+service = st.sidebar.selectbox("Choose Service", service_options)
+
+# Add Custom Service
+st.sidebar.subheader("➕ Add Custom Service")
+custom_service = st.sidebar.text_input("Enter Custom Service Name")
+if st.sidebar.button("Add Service"):
+    if custom_service.strip():
+        st.session_state.custom_services[cloud_provider].append(custom_service.strip())
+        st.success(f"✅ {custom_service} added successfully to {cloud_provider} services!")
+
+# Generate configuration
+if st.sidebar.button("Generate Configuration"):
+    if not cloud_provider or not service:
+        st.warning("⚠️ Please select a Cloud Provider and Service before generating the configuration.")
+    else:
+        st.session_state.refinement_iteration = 0
+        generated_files = generate_code(cloud_provider, service)
+        if generated_files:
+            st.session_state.generated_files = generated_files
+            st.success(f"✅ Terraform Configuration generated successfully!")
+            display_code_with_download(generated_files)
+
+# Refinement Section
+st.subheader("🔄 Improve Configuration with Feedback")
+st.write("Provide specific feedback like:")
+st.markdown("""
+- Add security groups for better access control  
+- Refactor variables for improved flexibility  
+- Include output blocks for improved integration  
+""")
+
+refine_feedback = st.text_area("✍️ Provide feedback to refine the configuration:", height=150)
+if st.button("Refine Configuration"):
+    if "generated_files" not in st.session_state or not st.session_state.generated_files:
+        st.warning("⚠️ Generate a configuration first before refining.")
+    elif not refine_feedback.strip():
+        st.warning("⚠️ Please provide feedback before refining.")
+    else:
+        st.session_state.refinement_iteration += 1
+        refined_files = {
+    'variables': refine_code(refine_feedback, st.session_state.generated_files['variables'], cloud_provider, service),
+    'main': refine_code(refine_feedback, st.session_state.generated_files['main'], cloud_provider, service),
+    'outputs': st.session_state.generated_files['outputs'],
+    'instructions': st.session_state.generated_files['instructions']
+}
+        if refined_files:
+            st.session_state.generated_files = refined_files
+            st.success(f"✅ Configuration refined successfully! (Iteration {st.session_state.refinement_iteration})")
+            display_code_with_download(refined_files)
